@@ -23,13 +23,30 @@ import com.oltpbenchmark.api.TransactionTypes;
 import com.oltpbenchmark.api.Worker;
 import com.oltpbenchmark.types.DatabaseType;
 import com.oltpbenchmark.types.State;
-import com.oltpbenchmark.util.*;
+import com.oltpbenchmark.util.ClassUtil;
+import com.oltpbenchmark.util.FileUtil;
+import com.oltpbenchmark.util.ImmutableMonitorInfo;
+import com.oltpbenchmark.util.JSONSerializable;
+import com.oltpbenchmark.util.JSONUtil;
+import com.oltpbenchmark.util.MonitorInfo;
+import com.oltpbenchmark.util.ResultWriter;
+import com.oltpbenchmark.util.StringUtil;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.sql.SQLException;
-import java.util.*;
-import org.apache.commons.cli.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
 import org.apache.commons.collections4.map.ListOrderedMap;
 import org.apache.commons.configuration2.HierarchicalConfiguration;
 import org.apache.commons.configuration2.XMLConfiguration;
@@ -606,6 +623,11 @@ public class DBWorkload {
         "Base directory for the result files, default is current directory");
     options.addOption(null, "dialects-export", true, "Export benchmark SQL to a dialects file");
     options.addOption("jh", "json-histograms", true, "Export histograms to JSON file");
+    options.addOption(
+        "sp",
+        "scheduler-params",
+        true,
+        "Scheduler parameters to test in format: param1:val1,val2;param2:val3,val4");
     return options;
   }
 
@@ -785,10 +807,72 @@ public class DBWorkload {
               bench.getBenchmarkName().toUpperCase(), num_phases, (num_phases > 1 ? "s" : "")));
       workConfs.add(bench.getWorkloadConfiguration());
     }
+
+    // Configure scheduler parameters if provided
+    if (argsLine.hasOption("sp")) {
+      String schedulerParamsStr = argsLine.getOptionValue("sp");
+      Map<String, List<Object>> schedulerParams = parseSchedulerParams(schedulerParamsStr);
+
+      // Calculate total number of workers across all benchmarks
+      int totalWorkers = 0;
+      for (WorkloadConfiguration workConf : workConfs) {
+        totalWorkers += workConf.getTerminals();
+      }
+
+      // Configure the scheduler parameters with the total worker count
+      Results.configureSchedulerParams(schedulerParams, totalWorkers);
+    }
+
     Results r = ThreadBench.runRateLimitedBenchmark(workers, workConfs, monitorInfo, argsLine);
     LOG.info(SINGLE_LINE);
     LOG.info("Rate limited reqs/s: {}", r);
     return r;
+  }
+
+  /**
+   * Parse the scheduler parameters from command line format: param1:val1,val2;param2:val3,val4
+   *
+   * @param paramStr String in the specified format
+   * @return Map from parameter names to lists of values to test
+   */
+  private static Map<String, List<Object>> parseSchedulerParams(String paramStr) {
+    Map<String, List<Object>> result = new HashMap<>();
+
+    // Split parameters by semicolon
+    String[] paramPairs = paramStr.split(";");
+    for (String paramPair : paramPairs) {
+      // Split each parameter into name and values
+      String[] parts = paramPair.split(":");
+      if (parts.length != 2) {
+        LOG.warn("Invalid parameter format: " + paramPair + ". Expected 'name:val1,val2'");
+        continue;
+      }
+
+      String paramName = parts[0].trim();
+      String[] valueStrs = parts[1].split(",");
+      List<Object> values = new ArrayList<>();
+
+      // Parse each value (try as long first, then as double if that fails)
+      for (String valueStr : valueStrs) {
+        valueStr = valueStr.trim();
+        try {
+          // Try parsing as long first
+          values.add(Long.parseLong(valueStr));
+        } catch (NumberFormatException e) {
+          try {
+            // Try parsing as double
+            values.add(Double.parseDouble(valueStr));
+          } catch (NumberFormatException e2) {
+            // Just use as string
+            values.add(valueStr);
+          }
+        }
+      }
+
+      result.put(paramName, values);
+    }
+
+    return result;
   }
 
   private static void printUsage(Options options) {

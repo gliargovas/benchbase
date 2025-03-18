@@ -25,8 +25,15 @@ import com.oltpbenchmark.types.State;
 import com.oltpbenchmark.util.MonitorInfo;
 import com.oltpbenchmark.util.StringUtil;
 import com.oltpbenchmark.util.TimeUtil;
-import java.util.*;
-import org.apache.commons.cli.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import org.apache.commons.cli.CommandLine;
 import org.apache.commons.collections4.map.ListOrderedMap;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -179,6 +186,11 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
     String name = StringUtils.join(StringUtils.split(argsLine.getOptionValue("b"), ','), '-');
     String baseFileName = name + "_" + TimeUtil.getCurrentTimeString();
 
+    // Start perf counters in background thread (non-blocking)
+    // This starts the daemon thread that will cycle through all scheduler parameters
+    LOG.info("Starting performance measurements in the background");
+    Results.startPerfCounters(baseFileName);
+
     // Main Loop
     while (true) {
       // posting new work... and resetting the queue in case we have new
@@ -300,7 +312,7 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
         }
         start = now;
         LOG.info("{} :: Warmup complete, starting measurements.", StringUtil.bold("MEASURE"));
-        Results.startPerfCounters(baseFileName);
+
         // measureEnd = measureStart + measureSeconds * 1000000000L;
 
         // For serial executions, we want to do every query exactly
@@ -325,6 +337,9 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
         this.monitor.join(MONITOR_REJOIN_TIME);
         this.monitor.tearDown();
       }
+
+      // Stop any running perf counters
+      Results.stopPerfCounters();
     } catch (Exception e) {
       LOG.error(e.getMessage(), e);
     }

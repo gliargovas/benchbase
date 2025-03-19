@@ -66,6 +66,7 @@ public final class Results {
   private static Map<String, List<Object>> schedulerParamOptions = new HashMap<>();
   private static int workerCount = 4; // Default worker count
   private static Thread perfThread = null;
+  private static int MEASUREMENT_WINDOW_SECONDS = 15; // Default window length
 
   // Track measurement windows for later histogram generation
   private static final Map<String, MeasurementWindow> measurementWindows = new HashMap<>();
@@ -140,7 +141,6 @@ public final class Results {
     }
 
     // Each combination needs MEASUREMENT_WINDOW_SECONDS + PARAM_APPLY_WAIT_SECONDS
-    final int MEASUREMENT_WINDOW_SECONDS = 15;
     final int PARAM_APPLY_WAIT_SECONDS = 2;
 
     return combinations * (MEASUREMENT_WINDOW_SECONDS + PARAM_APPLY_WAIT_SECONDS);
@@ -297,6 +297,21 @@ public final class Results {
   public static void configureSchedulerParams(Map<String, List<Object>> params, int workers) {
     schedulerParamOptions = params;
     workerCount = workers;
+
+    // Print more detailed information about the scheduler parameters
+    StringBuilder paramDetails = new StringBuilder();
+    paramDetails.append("Scheduler parameters configuration:\n");
+    for (Map.Entry<String, List<Object>> entry : params.entrySet()) {
+      paramDetails.append("  - ").append(entry.getKey()).append(": ");
+      if (entry.getValue().size() == 1) {
+        paramDetails.append(entry.getValue().get(0));
+      } else {
+        paramDetails.append(entry.getValue());
+      }
+      paramDetails.append("\n");
+    }
+    LOG.info(paramDetails.toString());
+
     LOG.info(
         "Configured scheduler parameter search with {} parameters and {} workers",
         params.size(),
@@ -305,6 +320,17 @@ public final class Results {
     // Log the total required time for all combinations
     int requiredTime = calculateTotalRequiredTime();
     LOG.info("Total required time for all parameter combinations: {} seconds", requiredTime);
+  }
+
+  /**
+   * Configure the measurement window length
+   *
+   * @param seconds Length of the measurement window in seconds
+   */
+  public static void configureMeasurementWindowSeconds(int seconds) {
+    MEASUREMENT_WINDOW_SECONDS = seconds;
+    LOG.info("Set measurement window length to {} seconds", seconds);
+    LOG.info("Each parameter combination will be measured for exactly {} seconds", seconds);
   }
 
   /**
@@ -318,8 +344,26 @@ public final class Results {
       executor = Executors.newCachedThreadPool();
     }
 
-    final String outputDirectory = "perfResults";
+    // Use the same base directory as other results
+    String baseDirectory = "results";
+    // Extract directory from baseFileName if present
+    if (baseFileName.contains("/")) {
+      int lastSlash = baseFileName.lastIndexOf('/');
+      baseDirectory = baseFileName.substring(0, lastSlash);
+    }
+
+    // Create a perf subdirectory within the main results directory
+    final String outputDirectory = baseDirectory + "/perf";
     FileUtil.makeDirIfNotExists(outputDirectory);
+
+    // Print the absolute path of the perf results directory
+    try {
+      File outputDirFile = new File(outputDirectory);
+      String absOutputPath = outputDirFile.getAbsolutePath();
+      LOG.info("Performance measurement files will be stored in: {}", absOutputPath);
+    } catch (Exception e) {
+      LOG.warn("Could not determine absolute path for perf results directory");
+    }
 
     // Create a daemon thread that will handle all scheduler parameter changes and perf measurements
     if (perfThread != null && perfThread.isAlive()) {
@@ -375,9 +419,25 @@ public final class Results {
                         + ".perf.record.txt";
 
                 LOG.info("Starting perf measurements with configuration: {}", paramStr);
+                LOG.info("Creating performance files:");
+                LOG.info("  - Perf stat file: {}", perfStatOutput);
+                LOG.info("  - Perf record file: {}", perfRecordOutput);
+
+                // Print detailed parameter information for this measurement window
+                StringBuilder paramDetails = new StringBuilder();
+                paramDetails.append("Current parameter set details:\n");
+                for (Map.Entry<String, Object> entry : params.getParams().entrySet()) {
+                  paramDetails
+                      .append("  - ")
+                      .append(entry.getKey())
+                      .append(": ")
+                      .append(entry.getValue())
+                      .append("\n");
+                }
+                LOG.info(paramDetails.toString());
 
                 // Define measurement duration (in seconds)
-                final int measurementWindow = 15;
+                final int measurementWindow = MEASUREMENT_WINDOW_SECONDS;
                 Collection<Process> currentMeasurementProcesses = new ArrayList<>();
 
                 // Record the measurement start time
@@ -459,6 +519,7 @@ public final class Results {
                     // Create a separate CSV file with performance metrics and timestamps
                     String perfCsvOutput =
                         outputDirectory + "/" + threadBaseFileName + "." + paramStr + ".perf.csv";
+                    LOG.info("Creating CSV file with performance metrics: {}", perfCsvOutput);
                     FileWriter csvWriter = new FileWriter(perfCsvOutput);
 
                     // Write CSV header

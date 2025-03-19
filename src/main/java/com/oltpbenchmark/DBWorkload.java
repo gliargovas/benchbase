@@ -246,6 +246,20 @@ public class DBWorkload {
         initDebug.put("Selectivity", selectivity);
       }
 
+      // Add scheduler parameters to debug output if available
+      if (argsLine.hasOption("sp")) {
+        String schedulerParamsStr = argsLine.getOptionValue("sp");
+        initDebug.put("Scheduler Parameters", schedulerParamsStr);
+      }
+
+      // Add measurement window length to debug output if available
+      if (argsLine.hasOption("mw")) {
+        int measurementWindowSeconds = Integer.parseInt(argsLine.getOptionValue("mw"));
+        initDebug.put("Measurement Window (seconds)", measurementWindowSeconds);
+      } else {
+        initDebug.put("Measurement Window (seconds)", "15 (default)");
+      }
+
       LOG.info("{}\n\n{}", SINGLE_LINE, StringUtil.formatMaps(initDebug));
       LOG.info(SINGLE_LINE);
 
@@ -597,6 +611,20 @@ public class DBWorkload {
     if (isBooleanOptionSet(argsLine, "execute")) {
       // Bombs away!
       try {
+        // If an output directory is used, store the information
+        String outputDirectory = "results";
+        if (argsLine.hasOption("d")) {
+          outputDirectory = argsLine.getOptionValue("d");
+        }
+
+        // Print paths for easy reference
+        File outputDirFile = new File(outputDirectory);
+        String absOutputPath = outputDirFile.getAbsolutePath();
+        LOG.info("{}", SINGLE_LINE);
+        LOG.info("Benchmark result files will be stored in: {}", absOutputPath);
+        LOG.info("Performance measurement files will be stored in: {}/perf", absOutputPath);
+        LOG.info("{}", SINGLE_LINE);
+
         Results r = runWorkload(benchList, monitorInfo, argsLine);
         writeOutputs(r, activeTXTypes, argsLine, xmlConfig, r.baseFileName);
         writeHistograms(r);
@@ -653,6 +681,11 @@ public class DBWorkload {
         "scheduler-params",
         true,
         "Scheduler parameters to test in format: param1:val1,val2;param2:val3,val4");
+    options.addOption(
+        "mw",
+        "measurement-window-seconds",
+        true,
+        "Length of the measurement window for performance tests in seconds (default: 15)");
     return options;
   }
 
@@ -864,10 +897,19 @@ public class DBWorkload {
         }
       }
     }
+
+    // Configure measurement window length if provided
+    if (argsLine.hasOption("mw")) {
+      int measurementWindowSeconds = Integer.parseInt(argsLine.getOptionValue("mw"));
+      Results.configureMeasurementWindowSeconds(measurementWindowSeconds);
+    }
+
+    // Use the default value if the time configuration is insufficient
+    String timeConfigWarning = Results.getTimeConfigurationWarning(totalBenchmarkSeconds);
+
     // Display warning if needed
-    final String warningMessage = Results.getTimeConfigurationWarning(totalBenchmarkSeconds);
-    if (warningMessage != null) {
-      LOG.warn(warningMessage);
+    if (timeConfigWarning != null) {
+      LOG.warn(timeConfigWarning);
     }
 
     Results r = ThreadBench.runRateLimitedBenchmark(workers, workConfs, monitorInfo, argsLine);

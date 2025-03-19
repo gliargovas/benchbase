@@ -36,8 +36,12 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class Results {
+
+  private static final Logger LOG = LoggerFactory.getLogger(Results.class);
 
   private final State state;
   private final long startTimestampMs;
@@ -62,6 +66,117 @@ public final class Results {
   private static Map<String, List<Object>> schedulerParamOptions = new HashMap<>();
   private static int workerCount = 4; // Default worker count
   private static Thread perfThread = null;
+
+  // Track measurement windows for later histogram generation
+  private static final Map<String, MeasurementWindow> measurementWindows = new HashMap<>();
+
+  /** Class to represent a measurement window with start/end times and parameter info */
+  public static class MeasurementWindow {
+    private final String parameterSetId;
+    private final long startTimeMs;
+    private final long endTimeMs;
+    private final Map<String, Object> parameters;
+
+    public MeasurementWindow(
+        String id, long startTimeMs, long endTimeMs, Map<String, Object> params) {
+      this.parameterSetId = id;
+      this.startTimeMs = startTimeMs;
+      this.endTimeMs = endTimeMs;
+      this.parameters = params;
+    }
+
+    public String getParameterSetId() {
+      return parameterSetId;
+    }
+
+    public long getStartTimeMs() {
+      return startTimeMs;
+    }
+
+    public long getEndTimeMs() {
+      return endTimeMs;
+    }
+
+    public Map<String, Object> getParameters() {
+      return parameters;
+    }
+
+    public boolean containsTimestamp(long timestampMs) {
+      return timestampMs >= startTimeMs && timestampMs <= endTimeMs;
+    }
+  }
+
+  /** Get all measurement windows recorded during the benchmark */
+  public static Collection<MeasurementWindow> getMeasurementWindows() {
+    return measurementWindows.values();
+  }
+
+  /** Check if a given time falls within any measurement window */
+  public static MeasurementWindow findWindowForTimestamp(long timestampMs) {
+    for (MeasurementWindow window : measurementWindows.values()) {
+      if (window.containsTimestamp(timestampMs)) {
+        return window;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Calculate total needed time for all parameter combinations
+   *
+   * @return Time in seconds needed for all measurements
+   */
+  public static int calculateTotalRequiredTime() {
+    // Calculate how many parameter combinations we have
+    int combinations = 1;
+    if (!schedulerParamOptions.isEmpty()) {
+      combinations = 0;
+      List<SchedulerParams> paramCombinations =
+          generateSchedulerCombinations(schedulerParamOptions, workerCount);
+      combinations = paramCombinations.size();
+    } else {
+      // Default set has 6 combinations (3 min_granularity × 2 latency values)
+      combinations = 6;
+    }
+
+    // Each combination needs MEASUREMENT_WINDOW_SECONDS + PARAM_APPLY_WAIT_SECONDS
+    final int MEASUREMENT_WINDOW_SECONDS = 15;
+    final int PARAM_APPLY_WAIT_SECONDS = 2;
+
+    return combinations * (MEASUREMENT_WINDOW_SECONDS + PARAM_APPLY_WAIT_SECONDS);
+  }
+
+  /**
+   * Check if the benchmark is configured to run long enough for all parameter combinations
+   *
+   * @param benchmarkTimeSeconds The configured benchmark run time in seconds
+   * @return true if time is sufficient, false otherwise
+   */
+  public static boolean isTimeConfigurationSufficient(int benchmarkTimeSeconds) {
+    int requiredTime = calculateTotalRequiredTime();
+    LOG.info("Total required time for all parameter combinations: {} seconds", requiredTime);
+    LOG.info("Benchmark time: {} seconds", benchmarkTimeSeconds);
+    return benchmarkTimeSeconds >= requiredTime;
+  }
+
+  /**
+   * Generate warning message if benchmark time is insufficient
+   *
+   * @param benchmarkTimeSeconds The configured benchmark run time
+   * @return Warning message or null if configuration is sufficient
+   */
+  public static String getTimeConfigurationWarning(int benchmarkTimeSeconds) {
+    LOG.info("Benchmark time: {} seconds", benchmarkTimeSeconds);
+    int requiredTime = calculateTotalRequiredTime();
+    LOG.info("Required time: {} seconds", requiredTime);
+    if (benchmarkTimeSeconds < requiredTime) {
+      return String.format(
+          "WARNING: Benchmark configured runtime (%d seconds) is less than required for all scheduler parameter combinations (%d seconds). "
+              + "Some parameter combinations may not be tested. Recommended setting: at least %d seconds.",
+          benchmarkTimeSeconds, requiredTime, requiredTime);
+    }
+    return null;
+  }
 
   /** A simple class to represent scheduler parameters */
   public static class SchedulerParams {
@@ -111,6 +226,8 @@ public final class Results {
       List<SchedulerParams> result,
       int workers) {
 
+    // TODO REMOVE
+    workers = 1;
     if (keyIndex >= keys.size()) {
       // Check if the combination meets the condition: min_granularity_ns <= latency_ns / workers
       Object minGranularity =
@@ -143,7 +260,7 @@ public final class Results {
 
   /** Apply scheduler parameters by writing to the appropriate files */
   private static void applySchedulerParams(SchedulerParams params) {
-    System.out.println("Applying scheduler parameters: " + params.toFilenameSafeString());
+    LOG.info("Applying scheduler parameters: {}", params.toFilenameSafeString());
 
     for (Map.Entry<String, Object> param : params.getParams().entrySet()) {
       String paramPath = "/sys/kernel/debug/sched/" + param.getKey();
@@ -153,17 +270,17 @@ public final class Results {
           FileWriter writer = new FileWriter(file);
           writer.write(String.valueOf(param.getValue()));
           writer.close();
-          System.out.println("Set " + param.getKey() + " to " + param.getValue());
+          LOG.info("Set {} to {}", param.getKey(), param.getValue());
         } else {
-          System.err.println("Warning: Parameter file not found: " + paramPath);
+          LOG.warn("Warning: Parameter file not found: {}", paramPath);
         }
       } catch (IOException e) {
-        System.err.println("Error setting parameter " + param.getKey() + ": " + e.getMessage());
+        LOG.error("Error setting parameter {}: {}", param.getKey(), e.getMessage());
       }
     }
 
     // Wait for the changes to apply
-    System.out.println("Waiting 2 seconds for scheduler parameters to apply...");
+    LOG.info("Waiting 2 seconds for scheduler parameters to apply...");
     try {
       Thread.sleep(2000);
     } catch (InterruptedException e) {
@@ -180,12 +297,14 @@ public final class Results {
   public static void configureSchedulerParams(Map<String, List<Object>> params, int workers) {
     schedulerParamOptions = params;
     workerCount = workers;
-    System.out.println(
-        "Configured scheduler parameter search with "
-            + params.size()
-            + " parameters and "
-            + workers
-            + " workers");
+    LOG.info(
+        "Configured scheduler parameter search with {} parameters and {} workers",
+        params.size(),
+        workers);
+
+    // Log the total required time for all combinations
+    int requiredTime = calculateTotalRequiredTime();
+    LOG.info("Total required time for all parameter combinations: {} seconds", requiredTime);
   }
 
   /**
@@ -204,34 +323,34 @@ public final class Results {
 
     // Create a daemon thread that will handle all scheduler parameter changes and perf measurements
     if (perfThread != null && perfThread.isAlive()) {
-      System.out.println(
-          "Performance monitoring thread is already running, not starting a new one");
+      LOG.info("Performance monitoring thread is already running, not starting a new one");
       return;
     }
+
+    // Clear any previous measurement windows
+    measurementWindows.clear();
 
     perfThread =
         new Thread(
             () -> {
               final String threadBaseFileName = baseFileName;
-              System.out.println("Starting performance measurement thread");
+              LOG.info("Starting performance measurement thread");
 
               // Use configured parameters or default if not set
               Map<String, List<Object>> paramOptionsToUse = schedulerParamOptions;
               if (paramOptionsToUse.isEmpty()) {
                 // Define default scheduler parameters to test
                 paramOptionsToUse = new HashMap<>();
-                paramOptionsToUse.put(
-                    "min_granularity_ns", Arrays.asList(1000000, 2000000, 3000000));
-                paramOptionsToUse.put("latency_ns", Arrays.asList(10000000, 20000000));
-                System.out.println("Using default scheduler parameter options");
+                paramOptionsToUse.put("min_granularity_ns", Arrays.asList(10000, 20000000));
+                paramOptionsToUse.put("latency_ns", Arrays.asList(10000, 20000000));
+                LOG.info("Using default scheduler parameter options");
               }
 
               // Generate all valid combinations
               List<SchedulerParams> paramCombinations =
                   generateSchedulerCombinations(paramOptionsToUse, workerCount);
 
-              System.out.println(
-                  "Testing " + paramCombinations.size() + " scheduler parameter combinations");
+              LOG.info("Testing {} scheduler parameter combinations", paramCombinations.size());
 
               // Run each combination
               for (SchedulerParams params : paramCombinations) {
@@ -255,11 +374,28 @@ public final class Results {
                         + paramStr
                         + ".perf.record.txt";
 
-                System.out.println("Starting perf measurements with configuration: " + paramStr);
+                LOG.info("Starting perf measurements with configuration: {}", paramStr);
 
                 // Define measurement duration (in seconds)
                 final int measurementWindow = 15;
                 Collection<Process> currentMeasurementProcesses = new ArrayList<>();
+
+                // Record the measurement start time
+                final long measurementStartMs = System.currentTimeMillis();
+                final long measurementEndMs = measurementStartMs + (measurementWindow * 1000L);
+
+                // Store the measurement window for later histogram generation
+                final String windowId = paramStr;
+                measurementWindows.put(
+                    windowId,
+                    new MeasurementWindow(
+                        windowId, measurementStartMs, measurementEndMs, params.getParams()));
+
+                LOG.info(
+                    "Recording transactions between {} and {} ms for parameter set: {}",
+                    measurementStartMs,
+                    measurementEndMs,
+                    paramStr);
 
                 // Run perf stat and perf sched record in parallel
                 Process statProcess = null;
@@ -310,9 +446,52 @@ public final class Results {
                     }
                   }
 
-                  System.out.println("Completed perf measurements for " + paramStr);
+                  // Append timestamps to the perf stat output file
+                  try {
+                    FileWriter timestampWriter = new FileWriter(perfStatOutput, true);
+                    timestampWriter.write("\n\n# Measurement window information:\n");
+                    timestampWriter.write("# Start timestamp (ms): " + measurementStartMs + "\n");
+                    timestampWriter.write("# End timestamp (ms): " + measurementEndMs + "\n");
+                    timestampWriter.write("# Parameter set: " + paramStr + "\n");
+                    timestampWriter.close();
+                    LOG.info("Added timestamp information to perf output file");
+
+                    // Create a separate CSV file with performance metrics and timestamps
+                    String perfCsvOutput =
+                        outputDirectory + "/" + threadBaseFileName + "." + paramStr + ".perf.csv";
+                    FileWriter csvWriter = new FileWriter(perfCsvOutput);
+
+                    // Write CSV header
+                    csvWriter.write("event_type,start_time_ms,end_time_ms,param_set_id");
+                    // Add parameter columns
+                    for (String paramName : params.getParams().keySet()) {
+                      csvWriter.write("," + paramName);
+                    }
+                    csvWriter.write("\n");
+
+                    // Write measurement window data
+                    csvWriter.write(
+                        String.format(
+                            "measurement,%d,%d,%s",
+                            measurementStartMs, measurementEndMs, windowId));
+
+                    // Add parameter values
+                    for (Map.Entry<String, Object> param : params.getParams().entrySet()) {
+                      csvWriter.write("," + param.getValue());
+                    }
+                    csvWriter.write("\n");
+
+                    csvWriter.close();
+                    LOG.info(
+                        "Created CSV file with performance metrics and timestamps: {}",
+                        perfCsvOutput);
+                  } catch (IOException e) {
+                    LOG.error("Failed to append timestamps to perf output: {}", e.getMessage());
+                  }
+
+                  LOG.info("Completed perf measurements for {}", paramStr);
                 } catch (Exception e) {
-                  System.err.println("Error running perf measurements: " + e.getMessage());
+                  LOG.error("Error running perf measurements: {}", e.getMessage());
                 } finally {
                   // Clean up any processes that might still be running
                   for (Process process : currentMeasurementProcesses) {
@@ -326,15 +505,14 @@ public final class Results {
                 // Continue to next parameter set without blocking main thread
               }
 
-              System.out.println(
-                  "Performance measurement thread completed all parameter combinations");
+              LOG.info("Performance measurement thread completed all parameter combinations");
             });
 
     // Set as daemon so it doesn't prevent JVM shutdown
     perfThread.setDaemon(true);
     perfThread.start();
 
-    System.out.println("Started performance measurement thread in the background");
+    LOG.info("Started performance measurement thread in the background");
   }
 
   /**
@@ -386,9 +564,9 @@ public final class Results {
                   }
                 }
 
-                System.out.println("All perf measurements cleanup completed");
+                LOG.info("All perf measurements cleanup completed");
               } catch (Exception e) {
-                System.err.println("Error during perf cleanup: " + e.getMessage());
+                LOG.error("Error during perf cleanup: {}", e.getMessage());
               }
             });
 
@@ -396,7 +574,7 @@ public final class Results {
     cleanupThread.setDaemon(true);
     cleanupThread.start();
 
-    System.out.println("Initiated shutdown of perf measurements in background");
+    LOG.info("Initiated shutdown of perf measurements in background");
   }
 
   public Results(

@@ -25,7 +25,6 @@ import com.oltpbenchmark.types.DatabaseType;
 import com.oltpbenchmark.types.State;
 import com.oltpbenchmark.util.ClassUtil;
 import com.oltpbenchmark.util.FileUtil;
-import com.oltpbenchmark.util.ImmutableMonitorInfo;
 import com.oltpbenchmark.util.JSONSerializable;
 import com.oltpbenchmark.util.JSONUtil;
 import com.oltpbenchmark.util.MonitorInfo;
@@ -96,17 +95,44 @@ public class DBWorkload {
     }
 
     // Monitoring setup.
-    ImmutableMonitorInfo.Builder builder = ImmutableMonitorInfo.builder();
+    // Create a simple MonitorInfo implementation since ImmutableMonitorInfo is not available
+    class SimpleMonitorInfo implements MonitorInfo {
+      private int interval = 0;
+      private MonitorInfo.MonitoringType type = MonitorInfo.MonitoringType.THROUGHPUT;
+
+      @Override
+      public int getMonitoringInterval() {
+        return interval;
+      }
+
+      @Override
+      public MonitoringType getMonitoringType() {
+        return type;
+      }
+
+      // Custom setters
+      public void updateInterval(int val) {
+        this.interval = val;
+      }
+
+      public void updateType(MonitoringType val) {
+        this.type = val;
+      }
+    }
+
+    SimpleMonitorInfo monitorInfoImpl = new SimpleMonitorInfo();
+    MonitorInfo monitorInfo = monitorInfoImpl;
+
     if (argsLine.hasOption("im")) {
-      builder.monitoringInterval(Integer.parseInt(argsLine.getOptionValue("im")));
+      monitorInfoImpl.updateInterval(Integer.parseInt(argsLine.getOptionValue("im")));
     }
     if (argsLine.hasOption("mt")) {
       switch (argsLine.getOptionValue("mt")) {
         case "advanced":
-          builder.monitoringType(MonitorInfo.MonitoringType.ADVANCED);
+          monitorInfoImpl.updateType(MonitorInfo.MonitoringType.ADVANCED);
           break;
         case "throughput":
-          builder.monitoringType(MonitorInfo.MonitoringType.THROUGHPUT);
+          monitorInfoImpl.updateType(MonitorInfo.MonitoringType.THROUGHPUT);
           break;
         default:
           throw new ParseException(
@@ -115,7 +141,6 @@ public class DBWorkload {
                   + "' is undefined, allowed values are: advanced/throughput");
       }
     }
-    MonitorInfo monitorInfo = builder.build();
 
     // -------------------------------------------------------------------
     // GET PLUGIN LIST
@@ -778,6 +803,9 @@ public class DBWorkload {
         rw.writeResults(windowSize, ps, t);
       }
     }
+
+    // Generate histograms for each parameter measurement window
+    rw.writeParameterWindowHistograms(activeTXTypes, outputDirectory, baseFileName);
   }
 
   private static void runCreator(BenchmarkModule bench) throws SQLException, IOException {
@@ -808,6 +836,8 @@ public class DBWorkload {
       workConfs.add(bench.getWorkloadConfiguration());
     }
 
+    int totalBenchmarkSeconds = 0;
+
     // Configure scheduler parameters if provided
     if (argsLine.hasOption("sp")) {
       String schedulerParamsStr = argsLine.getOptionValue("sp");
@@ -821,6 +851,23 @@ public class DBWorkload {
 
       // Configure the scheduler parameters with the total worker count
       Results.configureSchedulerParams(schedulerParams, totalWorkers);
+
+      // Check if benchmark runtime is sufficient for all parameter combinations
+      // Calculate the total runtime across all phases
+
+      for (WorkloadConfiguration workConf : workConfs) {
+        for (Phase phase : workConf.getPhases()) {
+          // Add both warmup and measured time
+          totalBenchmarkSeconds += phase.getTime();
+          totalBenchmarkSeconds += phase.getWarmupTime();
+          totalBenchmarkSeconds += 2;
+        }
+      }
+    }
+    // Display warning if needed
+    final String warningMessage = Results.getTimeConfigurationWarning(totalBenchmarkSeconds);
+    if (warningMessage != null) {
+      LOG.warn(warningMessage);
     }
 
     Results r = ThreadBench.runRateLimitedBenchmark(workers, workConfs, monitorInfo, argsLine);

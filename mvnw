@@ -34,6 +34,8 @@
 #   MAVEN_SKIP_RC - flag to disable loading of mavenrc files
 # ----------------------------------------------------------------------------
 
+export BENCHBASE_PROFILE=postgres
+
 if [ -z "$MAVEN_SKIP_RC" ] ; then
 
   if [ -f /usr/local/etc/mavenrc ] ; then

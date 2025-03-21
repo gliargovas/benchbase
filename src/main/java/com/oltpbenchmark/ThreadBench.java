@@ -22,11 +22,15 @@ import com.oltpbenchmark.api.Worker;
 import com.oltpbenchmark.api.collectors.monitoring.Monitor;
 import com.oltpbenchmark.api.collectors.monitoring.MonitorGen;
 import com.oltpbenchmark.types.State;
+import com.oltpbenchmark.util.FileUtil;
+import com.oltpbenchmark.util.JSONUtil;
 import com.oltpbenchmark.util.MonitorInfo;
 import com.oltpbenchmark.util.StringUtil;
 import com.oltpbenchmark.util.TimeUtil;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -52,17 +56,31 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
   private final ArrayList<LatencyRecord.Sample> samples = new ArrayList<>();
   private final MonitorInfo monitorInfo;
 
+  // For continuous reporting mode
+  private boolean continuousReporting = false;
+  private int continuousWindow = 15;
+  private boolean continuousPerf = false;
+  private int continuousBuffer = 0;
+
   private Monitor monitor = null;
 
   private ThreadBench(
       List<? extends Worker<? extends BenchmarkModule>> workers,
       List<WorkloadConfiguration> workConfs,
-      MonitorInfo monitorInfo) {
+      MonitorInfo monitorInfo,
+      boolean continuousReporting,
+      int continuousWindow,
+      boolean continuousPerf,
+      int continuousBuffer) {
     this.workers = workers;
     this.workConfs = workConfs;
     this.workerThreads = new ArrayList<>(workers.size());
     this.monitorInfo = monitorInfo;
     this.testState = new BenchmarkState(workers.size() + 1);
+    this.continuousReporting = continuousReporting;
+    this.continuousWindow = continuousWindow;
+    this.continuousPerf = continuousPerf;
+    this.continuousBuffer = continuousBuffer;
   }
 
   public static Results runRateLimitedBenchmark(
@@ -70,7 +88,61 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
       List<WorkloadConfiguration> workConfs,
       MonitorInfo monitorInfo,
       CommandLine argsLine) {
-    ThreadBench bench = new ThreadBench(workers, workConfs, monitorInfo);
+    ThreadBench bench = new ThreadBench(workers, workConfs, monitorInfo, false, 15, false, 0);
+    return bench.runRateLimitedMultiPhase(argsLine);
+  }
+
+  public static Results runRateLimitedBenchmark(
+      List<Worker<? extends BenchmarkModule>> workers,
+      List<WorkloadConfiguration> workConfs,
+      MonitorInfo monitorInfo,
+      CommandLine argsLine,
+      boolean continuousReporting,
+      int continuousWindow) {
+    ThreadBench bench =
+        new ThreadBench(
+            workers, workConfs, monitorInfo, continuousReporting, continuousWindow, false, 0);
+    return bench.runRateLimitedMultiPhase(argsLine);
+  }
+
+  public static Results runRateLimitedBenchmark(
+      List<Worker<? extends BenchmarkModule>> workers,
+      List<WorkloadConfiguration> workConfs,
+      MonitorInfo monitorInfo,
+      CommandLine argsLine,
+      boolean continuousReporting,
+      int continuousWindow,
+      boolean continuousPerf) {
+    ThreadBench bench =
+        new ThreadBench(
+            workers,
+            workConfs,
+            monitorInfo,
+            continuousReporting,
+            continuousWindow,
+            continuousPerf,
+            0);
+    return bench.runRateLimitedMultiPhase(argsLine);
+  }
+
+  public static Results runRateLimitedBenchmark(
+      List<Worker<? extends BenchmarkModule>> workers,
+      List<WorkloadConfiguration> workConfs,
+      MonitorInfo monitorInfo,
+      CommandLine argsLine,
+      boolean continuousReporting,
+      int continuousWindow,
+      boolean continuousPerf,
+      int continuousBuffer) {
+    ThreadBench bench =
+        new ThreadBench(
+            workers,
+            workConfs,
+            monitorInfo,
+            continuousReporting,
+            continuousWindow,
+            continuousPerf,
+            continuousBuffer);
     return bench.runRateLimitedMultiPhase(argsLine);
   }
 
@@ -186,10 +258,336 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
     String name = StringUtils.join(StringUtils.split(argsLine.getOptionValue("b"), ','), '-');
     String baseFileName = name + "_" + TimeUtil.getCurrentTimeString();
 
-    // Start perf counters in background thread (non-blocking)
-    // This starts the daemon thread that will cycle through all scheduler parameters
-    LOG.info("Starting performance measurements in the background");
-    Results.startPerfCounters(baseFileName);
+    // Check for barebones mode
+    boolean bareBonesRun = argsLine.hasOption("barebones-run");
+
+    // Start perf counters in background thread (non-blocking) if not in barebones mode
+    if (!bareBonesRun) {
+      // This starts the daemon thread that will cycle through all scheduler parameters
+      LOG.info("Starting performance measurements in the background");
+      Results.startPerfCounters(baseFileName);
+    } else {
+      LOG.info("Barebones run: skipping performance measurements");
+    }
+
+    // Start continuous reporting thread if enabled
+    if (this.continuousReporting) {
+      LOG.info("Starting continuous reporting thread with window size of {}s", continuousWindow);
+      // Set up a simple background thread to collect and report statistics periodically
+      Thread reportingThread =
+          new Thread(
+              () -> {
+                LOG.info("Continuous reporting thread started");
+
+                int windowNum = 0;
+                while (true) {
+                  try {
+                    // Sleep for the specified window
+                    Thread.sleep(continuousWindow * 1000);
+
+                    // Check if test is complete
+                    if (testState.getState() == State.EXIT || testState.getState() == State.DONE) {
+                      break;
+                    }
+
+                    // Skip if we're not in the measurement phase yet
+                    if (testState.getState() != State.MEASURE) {
+                      continue;
+                    }
+
+                    // Start a new measurement window
+                    windowNum++;
+
+                    // Record the start time of this measurement window
+                    long windowStartMs = System.currentTimeMillis();
+                    String windowStartTime = TimeUtil.getCurrentTimeString();
+
+                    LOG.info(
+                        "Starting continuous report for window #{} at {}",
+                        windowNum,
+                        windowStartTime);
+
+                    // We need to capture the current transaction counts at window start
+                    // so we can calculate only the new transactions in this window
+                    Map<Worker<?>, Integer> workerStartSuccesses = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartAborts = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartRetries = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartErrors = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartRequests = new HashMap<>();
+
+                    // Store the starting values for each worker
+                    for (Worker<?> worker : workers) {
+                      workerStartSuccesses.put(
+                          worker, worker.getTransactionSuccessHistogram().getSampleCount());
+                      workerStartAborts.put(
+                          worker, worker.getTransactionAbortHistogram().getSampleCount());
+                      workerStartRetries.put(
+                          worker, worker.getTransactionRetryHistogram().getSampleCount());
+                      workerStartErrors.put(
+                          worker, worker.getTransactionErrorHistogram().getSampleCount());
+                      workerStartRequests.put(worker, worker.getRequests());
+                    }
+
+                    // Sleep for the window duration
+                    Thread.sleep(continuousWindow * 1000);
+
+                    // Collect current statistics from all workers
+                    LOG.info("Collecting continuous report for window #{}", windowNum);
+
+                    int totalRequests = 0;
+                    int totalSuccesses = 0;
+                    int totalAborts = 0;
+                    int totalRetries = 0;
+                    int totalErrors = 0;
+                    List<Integer> latencies = new ArrayList<>();
+
+                    // Record end time of this measurement
+                    long windowEndMs = System.currentTimeMillis();
+                    String windowEndTime = TimeUtil.getCurrentTimeString();
+                    long actualWindowDurationMs = windowEndMs - windowStartMs;
+
+                    // Collect only transactions that happened during this window
+                    for (int i = 0; i < workers.size(); i++) {
+                      Worker<? extends BenchmarkModule> worker = workers.get(i);
+
+                      // Calculate transaction statistics for this window
+                      int startSuccesses = workerStartSuccesses.get(worker);
+                      int endSuccesses = worker.getTransactionSuccessHistogram().getSampleCount();
+                      int windowSuccesses = endSuccesses - startSuccesses;
+                      totalSuccesses += windowSuccesses;
+
+                      int startAborts = workerStartAborts.get(worker);
+                      int endAborts = worker.getTransactionAbortHistogram().getSampleCount();
+                      int windowAborts = endAborts - startAborts;
+                      totalAborts += windowAborts;
+
+                      int startRetries = workerStartRetries.get(worker);
+                      int endRetries = worker.getTransactionRetryHistogram().getSampleCount();
+                      int windowRetries = endRetries - startRetries;
+                      totalRetries += windowRetries;
+
+                      int startErrors = workerStartErrors.get(worker);
+                      int endErrors = worker.getTransactionErrorHistogram().getSampleCount();
+                      int windowErrors = endErrors - startErrors;
+                      totalErrors += windowErrors;
+
+                      int startRequests = workerStartRequests.get(worker);
+                      int endRequests = worker.getRequests();
+                      int windowRequests = endRequests - startRequests;
+                      totalRequests += windowRequests;
+
+                      // Add the latency samples from this worker
+                      latencies.addAll(collectLatencySamples(worker, windowSuccesses));
+                    }
+
+                    // Calculate throughput and goodput
+                    double throughput = totalRequests / (double) continuousWindow;
+                    double goodput = totalSuccesses / (double) continuousWindow;
+
+                    // Calculate latency percentiles if we have samples
+                    double avgLatency = 0;
+                    int minLatency = 0;
+                    int maxLatency = 0;
+                    int p25Latency = 0;
+                    int p50Latency = 0;
+                    int p75Latency = 0;
+                    int p90Latency = 0;
+                    int p99Latency = 0;
+
+                    if (!latencies.isEmpty()) {
+                      // Sort latencies for percentile calculation
+                      try {
+                        Collections.sort(latencies);
+                      } catch (IllegalArgumentException e) {
+                        LOG.warn(
+                            "Error during latency sorting - using unsorted latencies: {}",
+                            e.getMessage());
+                        // Continue with unsorted latencies
+                      }
+
+                      // Calculate statistics
+                      int sum = 0;
+                      for (int lat : latencies) {
+                        sum += lat;
+                      }
+                      avgLatency = sum / (double) latencies.size();
+                      minLatency = latencies.get(0);
+                      maxLatency = latencies.get(latencies.size() - 1);
+
+                      // Calculate percentiles
+                      p25Latency = getPercentile(latencies, 25);
+                      p50Latency = getPercentile(latencies, 50);
+                      p75Latency = getPercentile(latencies, 75);
+                      p90Latency = getPercentile(latencies, 90);
+                      p99Latency = getPercentile(latencies, 99);
+                    }
+
+                    // Prepare and write report file before logging
+                    String fileBase = baseFileName.replace(".summary", "");
+
+                    // Determine output directory
+                    String outputDirectory = "results";
+                    if (argsLine.hasOption("d")) {
+                      outputDirectory = argsLine.getOptionValue("d");
+                    }
+
+                    // Create the directory if it doesn't exist
+                    FileUtil.makeDirIfNotExists(outputDirectory);
+
+                    String reportPath =
+                        FileUtil.joinPath(
+                            outputDirectory, fileBase + ".window" + windowNum + ".json");
+
+                    Map<String, Object> report = new HashMap<>();
+                    report.put("window", windowNum);
+                    report.put("time_seconds", continuousWindow);
+                    report.put("throughput", throughput);
+                    report.put("goodput", goodput);
+                    report.put("success_total", totalSuccesses);
+                    report.put("requests_total", totalRequests);
+                    report.put("abort_total", totalAborts);
+                    report.put("retry_total", totalRetries);
+                    report.put("error_total", totalErrors);
+                    report.put(
+                        "success_rate",
+                        totalRequests > 0 ? (totalSuccesses * 100.0 / totalRequests) : 0.0);
+                    report.put("latency_avg", avgLatency);
+                    report.put("latency_min", minLatency);
+                    report.put("latency_max", maxLatency);
+                    report.put("latency_p25", p25Latency);
+                    report.put("latency_p50", p50Latency);
+                    report.put("latency_p75", p75Latency);
+                    report.put("latency_p90", p90Latency);
+                    report.put("latency_p99", p99Latency);
+                    report.put("timestamp_start", windowStartTime);
+                    report.put("timestamp_end", windowEndTime);
+                    report.put("timestamp_start_ms", windowStartMs);
+                    report.put("timestamp_end_ms", windowEndMs);
+                    report.put("actual_duration_ms", actualWindowDurationMs);
+
+                    // Add perf measurements if enabled
+                    if (continuousPerf) {
+                      try {
+                        // Create a perf measurement for this window
+                        String perfFileName = fileBase + ".window" + windowNum + ".perf";
+                        String perfFilePath = FileUtil.joinPath(outputDirectory, perfFileName);
+
+                        // Record precise timestamp right before starting perf
+                        long perfStartMs = System.currentTimeMillis();
+                        LOG.info("  Collecting performance metrics for window #{}", windowNum);
+
+                        // Use ProcessBuilder instead of deprecated Runtime.exec
+                        ProcessBuilder processBuilder =
+                            new ProcessBuilder(
+                                "perf",
+                                "stat",
+                                "-e",
+                                "cycles,instructions,cache-references,cache-misses",
+                                "-o",
+                                perfFilePath,
+                                "sleep",
+                                String.valueOf(continuousWindow));
+                        Process process = processBuilder.start();
+                        process.waitFor();
+
+                        // Record precise timestamp right after perf completes
+                        long perfEndMs = System.currentTimeMillis();
+
+                        // Add perf file location to the report
+                        report.put("perf_file", perfFileName);
+                        report.put("perf_start_ms", perfStartMs);
+                        report.put("perf_end_ms", perfEndMs);
+                        LOG.info("  Performance metrics saved to: {}", perfFilePath);
+
+                        // Write timestamp information to the perf file for later correlation
+                        try {
+                          String timestampInfo =
+                              "# Measurement window: "
+                                  + windowNum
+                                  + "\n"
+                                  + "# Start time: "
+                                  + perfStartMs
+                                  + " ms\n"
+                                  + "# End time: "
+                                  + perfEndMs
+                                  + " ms\n"
+                                  + "# Window start time: "
+                                  + windowStartMs
+                                  + " ms\n"
+                                  + "# Window end time: "
+                                  + windowEndMs
+                                  + " ms\n"
+                                  + "# Duration: "
+                                  + (perfEndMs - perfStartMs)
+                                  + " ms\n";
+
+                          FileUtil.appendStringToFile(new File(perfFilePath), timestampInfo);
+                        } catch (Exception e) {
+                          LOG.error("Error appending timestamp info to perf file", e);
+                        }
+                      } catch (Exception e) {
+                        LOG.error("Error collecting performance metrics", e);
+                      }
+                    }
+
+                    // Write report file immediately before printing to console
+                    try {
+                      FileUtil.writeStringToFile(
+                          new File(reportPath), JSONUtil.toJSONString(report));
+                    } catch (Exception e) {
+                      LOG.error("Error writing window report", e);
+                    }
+
+                    // Log detailed information about the window results
+                    LOG.info("Window #{} summary:", windowNum);
+                    LOG.info(
+                        "  Duration: {}s (actual: {} ms)",
+                        continuousWindow,
+                        actualWindowDurationMs);
+                    LOG.info(
+                        "  Throughput: {}/s, Goodput: {}/s, Success Rate: {:.2f}%",
+                        String.format("%.2f", throughput),
+                        String.format("%.2f", goodput),
+                        totalRequests > 0 ? (totalSuccesses * 100.0 / totalRequests) : 0.0);
+                    LOG.info(
+                        "  Transactions: {} successful, {} aborted, {} retried, {} errors, {} total",
+                        totalSuccesses,
+                        totalAborts,
+                        totalRetries,
+                        totalErrors,
+                        totalRequests);
+                    LOG.info("  Latency ({} samples):", latencies.size());
+                    LOG.info(
+                        "    Avg: {:.2f} μs, Min: {} μs, Max: {} μs",
+                        avgLatency,
+                        minLatency,
+                        maxLatency);
+                    LOG.info(
+                        "    p25: {} μs, p50: {} μs, p75: {} μs, p90: {} μs, p99: {} μs",
+                        p25Latency,
+                        p50Latency,
+                        p75Latency,
+                        p90Latency,
+                        p99Latency);
+
+                    // If a buffer time is specified, sleep for that period
+                    if (continuousBuffer > 0) {
+                      LOG.info("Waiting for buffer time of {}s between windows", continuousBuffer);
+                      Thread.sleep(continuousBuffer * 1000);
+                    }
+                  } catch (InterruptedException e) {
+                    break;
+                  } catch (Exception e) {
+                    LOG.error("Error in continuous reporting thread", e);
+                  }
+                }
+                LOG.info("Continuous reporting thread finished");
+              });
+
+      reportingThread.setDaemon(true);
+      reportingThread.start();
+      LOG.info("Continuous reporting is now active");
+    }
 
     // Main Loop
     while (true) {
@@ -338,8 +736,10 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
         this.monitor.tearDown();
       }
 
-      // Stop any running perf counters
-      Results.stopPerfCounters();
+      // Stop any running perf counters if not in barebones mode
+      if (!argsLine.hasOption("barebones-run")) {
+        Results.stopPerfCounters();
+      }
     } catch (Exception e) {
       LOG.error(e.getMessage(), e);
     }
@@ -354,7 +754,14 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
           samples.add(sample);
         }
       }
-      Collections.sort(samples);
+
+      // Use a try-catch block to handle potential sorting issues
+      try {
+        Collections.sort(samples);
+      } catch (IllegalArgumentException e) {
+        LOG.warn("Error during sample sorting - using unsorted samples: {}", e.getMessage());
+        // Continue with unsorted samples
+      }
 
       // Compute stats on all the latencies
       int[] latencies = new int[samples.size()];
@@ -570,5 +977,60 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
         LOG.info("Worker Thread Status:\n{}", StringUtil.formatMaps(m));
       }
     }
+  }
+
+  /**
+   * Helper method to calculate percentiles from a sorted list
+   *
+   * @param sorted Sorted list of values
+   * @param percentile Percentile to calculate (0-100)
+   * @return The value at the given percentile
+   */
+  private static int getPercentile(List<Integer> sorted, int percentile) {
+    if (sorted.isEmpty()) {
+      return 0;
+    }
+
+    int index = (int) Math.ceil(percentile / 100.0 * sorted.size()) - 1;
+    if (index < 0) {
+      index = 0;
+    }
+    return sorted.get(index);
+  }
+
+  /**
+   * Collects latency samples from a worker for a specific window. This ensures we only capture the
+   * latency samples that correspond to transactions completed during the measurement window, rather
+   * than using unreliable timestamps.
+   *
+   * @param worker The worker to collect latency samples from
+   * @param count The number of successful transactions completed in this window
+   * @return A list of valid latency values in microseconds
+   */
+  private List<Integer> collectLatencySamples(Worker<? extends BenchmarkModule> worker, int count) {
+    List<Integer> latencies = new ArrayList<>();
+
+    // Collect all valid latency samples from this worker
+    for (LatencyRecord.Sample sample : worker.getLatencyRecords()) {
+      if (sample.getLatencyMicrosecond() > 0) {
+        latencies.add(sample.getLatencyMicrosecond());
+      }
+    }
+
+    // Log how many samples we collected for debugging
+    LOG.debug(
+        "Worker {} collected {} latency samples (needed: {})",
+        worker.getId(),
+        latencies.size(),
+        count);
+
+    // If we have more samples than transactions, just take the most recent ones
+    // based on the count of successful transactions in this window
+    if (latencies.size() > count && count > 0) {
+      return latencies.subList(latencies.size() - count, latencies.size());
+    }
+
+    // Otherwise return all available samples
+    return latencies;
   }
 }

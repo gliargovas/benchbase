@@ -58,6 +58,9 @@ public final class Results {
   private final Map<TransactionType, Histogram<String>> abortMessages = new HashMap<>();
   public String baseFileName;
 
+  // Flag to indicate whether we're running in barebones mode (no perf metrics)
+  private static boolean barebonesMode = false;
+
   // Collection to store active perf processes for monitoring and cleanup
   private static final Collection<Process> activeProcesses = new ConcurrentLinkedQueue<>();
   private static ExecutorService executor;
@@ -70,6 +73,80 @@ public final class Results {
 
   // Track measurement windows for later histogram generation
   private static final Map<String, MeasurementWindow> measurementWindows = new HashMap<>();
+
+  // Flag to indicate whether continuous reporting mode is enabled
+  private static boolean continuousReportingMode = false;
+  private static int continuousReportingWindow = 15;
+  private static int continuousReportingBuffer = 0;
+
+  /**
+   * Set the barebones mode flag
+   *
+   * @param barebones true to enable barebones mode (disable performance monitoring)
+   */
+  public static void setBarebonesMode(boolean barebones) {
+    barebonesMode = barebones;
+    if (barebones) {
+      LOG.info("Barebones mode enabled: performance measurements disabled");
+    }
+  }
+
+  /**
+   * Set the continuous reporting mode flag
+   *
+   * @param enabled true to enable continuous reporting mode
+   * @param windowSeconds window size in seconds for continuous reporting (default: 15)
+   * @param bufferSeconds buffer time in seconds between windows (default: 0)
+   */
+  public static void setContinuousReportingMode(
+      boolean enabled, int windowSeconds, int bufferSeconds) {
+    continuousReportingMode = enabled;
+    continuousReportingWindow = windowSeconds;
+    continuousReportingBuffer = bufferSeconds;
+    if (enabled) {
+      LOG.info("Continuous reporting mode enabled with window size of {} seconds", windowSeconds);
+      if (bufferSeconds > 0) {
+        LOG.info("Buffer time between windows: {} seconds", bufferSeconds);
+      }
+    }
+  }
+
+  /**
+   * Set the continuous reporting mode flag
+   *
+   * @param enabled true to enable continuous reporting mode
+   * @param windowSeconds window size in seconds for continuous reporting (default: 15)
+   */
+  public static void setContinuousReportingMode(boolean enabled, int windowSeconds) {
+    setContinuousReportingMode(enabled, windowSeconds, 0);
+  }
+
+  /**
+   * Check if continuous reporting mode is enabled
+   *
+   * @return true if continuous reporting mode is enabled
+   */
+  public static boolean isContinuousReportingEnabled() {
+    return continuousReportingMode;
+  }
+
+  /**
+   * Get the window size for continuous reporting
+   *
+   * @return window size in seconds
+   */
+  public static int getContinuousReportingWindowSize() {
+    return continuousReportingWindow;
+  }
+
+  /**
+   * Get the buffer time between continuous reporting windows
+   *
+   * @return buffer time in seconds
+   */
+  public static int getContinuousReportingBufferTime() {
+    return continuousReportingBuffer;
+  }
 
   /** Class to represent a measurement window with start/end times and parameter info */
   public static class MeasurementWindow {
@@ -339,6 +416,12 @@ public final class Results {
    * benchmark thread.
    */
   public static void startPerfCounters(String baseFileName) {
+    // Skip if in barebones mode
+    if (barebonesMode) {
+      LOG.info("Barebones mode active: skipping performance measurements");
+      return;
+    }
+
     // Initialize if needed
     if (executor == null) {
       executor = Executors.newCachedThreadPool();
@@ -581,6 +664,12 @@ public final class Results {
    * non-blocking and will not affect the main benchmark results.
    */
   public static void stopPerfCounters() {
+    // Skip if in barebones mode
+    if (barebonesMode) {
+      LOG.info("Barebones mode active: no performance measurements to stop");
+      return;
+    }
+
     // Signal the thread to stop
     shutdownRequested = true;
 

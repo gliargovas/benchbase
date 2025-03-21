@@ -17,6 +17,7 @@
 
 package com.oltpbenchmark.util;
 
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -104,6 +105,20 @@ public abstract class FileUtil {
     try (FileWriter writer = new FileWriter(file)) {
       writer.write(content);
       writer.flush();
+    }
+  }
+
+  /**
+   * Append string content to a file
+   *
+   * @param path The path of the file to append to
+   * @param content The content to append
+   * @throws IOException
+   */
+  public static void appendStringToFile(File path, String content) throws IOException {
+    try (FileWriter fw = new FileWriter(path, true);
+        BufferedWriter bw = new BufferedWriter(fw)) {
+      bw.write(content);
     }
   }
 }

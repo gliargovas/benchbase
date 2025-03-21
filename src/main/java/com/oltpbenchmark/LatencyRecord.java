@@ -120,17 +120,34 @@ public class LatencyRecord implements Iterable<LatencyRecord.Sample> {
 
     @Override
     public int compareTo(Sample other) {
+      // First compare by start time
       long diff = this.startNanosecond - other.startNanosecond;
 
-      // explicit comparison to avoid long to int overflow
-      if (diff > 0) {
-        return 1;
-      } else if (diff < 0) {
-        return -1;
-      } else {
-
-        return 0;
+      if (diff != 0) {
+        // Return -1, 0, or 1 depending on the sign of diff
+        return diff < 0 ? -1 : 1;
       }
+
+      // If start times are equal, compare by latency
+      int latencyDiff = this.latencyMicrosecond - other.latencyMicrosecond;
+      if (latencyDiff != 0) {
+        return latencyDiff;
+      }
+
+      // If latencies are equal, compare by transaction type
+      int txDiff = this.transactionType - other.transactionType;
+      if (txDiff != 0) {
+        return txDiff;
+      }
+
+      // If transaction types are equal, compare by worker ID
+      int workerDiff = this.workerId - other.workerId;
+      if (workerDiff != 0) {
+        return workerDiff;
+      }
+
+      // Finally, compare by phase ID
+      return this.phaseId - other.phaseId;
     }
   }
 

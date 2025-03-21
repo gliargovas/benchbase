@@ -148,6 +148,48 @@ public class DBWorkload {
 
     String targetBenchmarks = argsLine.getOptionValue("b");
 
+    // -------------------------------------------------------------------
+    // CHECK FOR CONTINUOUS REPORTING MODE
+    // -------------------------------------------------------------------
+
+    boolean continuousReporting = false;
+    int continuousWindow = 15; // Default window size
+    boolean continuousPerf = false;
+    int continuousBuffer = 0; // Default no buffer between windows
+    if (argsLine.hasOption("continuous")) {
+      continuousReporting = true;
+      if (argsLine.hasOption("continuous-window")) {
+        continuousWindow = Integer.parseInt(argsLine.getOptionValue("continuous-window"));
+      }
+      if (argsLine.hasOption("continuous-perf")) {
+        continuousPerf = true;
+      }
+      if (argsLine.hasOption("continuous-buffer")) {
+        continuousBuffer = Integer.parseInt(argsLine.getOptionValue("continuous-buffer"));
+      }
+      LOG.info(SINGLE_LINE);
+      LOG.info(
+          "Continuous reporting mode enabled with window size of {} seconds", continuousWindow);
+      if (continuousBuffer > 0) {
+        LOG.info("Buffer time between windows: {} seconds", continuousBuffer);
+      }
+      LOG.info("Live window metrics will be reported periodically during the benchmark run");
+      LOG.info("Each window captures only transactions executed during that specific time period");
+      LOG.info(
+          "Latency samples are collected based on the number of successful transactions in each window");
+      LOG.info("Window reports will be saved to the results directory");
+      if (continuousPerf) {
+        LOG.info("Performance measurements will be collected during continuous reporting");
+      }
+      LOG.info(
+          "TIP: Consider using --barebones-run with --continuous for best monitoring experience");
+      LOG.info(
+          "Note: This mode runs alongside normal benchmark execution and reports live metrics");
+      LOG.info(
+          "      with latency distribution (Avg, P25, P50, P75, P90, P99, Min, Max) and goodput");
+      LOG.info(SINGLE_LINE);
+    }
+
     String[] targetList = targetBenchmarks.split(",");
     List<BenchmarkModule> benchList = new ArrayList<>();
 
@@ -625,7 +667,38 @@ public class DBWorkload {
         LOG.info("Performance measurement files will be stored in: {}/perf", absOutputPath);
         LOG.info("{}", SINGLE_LINE);
 
-        Results r = runWorkload(benchList, monitorInfo, argsLine);
+        // Check for barebones mode
+        boolean bareBonesRun = argsLine.hasOption("barebones-run");
+        if (bareBonesRun) {
+          LOG.info("Barebones run detected: disabling performance measurements");
+          Results.setBarebonesMode(true);
+        }
+
+        // Print out continuous reporting mode information if enabled
+        if (continuousReporting) {
+          LOG.info("Enabling continuous reporting mode:");
+          LOG.info("  - Window Size: {}s", continuousWindow);
+          LOG.info(
+              "  - Measurement windows will capture only transactions executed during that specific time period");
+          LOG.info(
+              "  - Latency samples are collected based on the number of successful transactions in each window");
+          LOG.info(
+              "  - Live window metrics will be reported periodically during the benchmark run");
+          LOG.info(
+              "  - Performance metrics will be collected via 'perf' for the entire window duration when --continuous-perf is enabled");
+
+          Results.setContinuousReportingMode(true, continuousWindow, continuousBuffer);
+        }
+
+        Results r =
+            runWorkload(
+                benchList,
+                monitorInfo,
+                argsLine,
+                continuousReporting,
+                continuousWindow,
+                continuousPerf,
+                continuousBuffer);
         writeOutputs(r, activeTXTypes, argsLine, xmlConfig, r.baseFileName);
         writeHistograms(r);
 
@@ -686,6 +759,31 @@ public class DBWorkload {
         "measurement-window-seconds",
         true,
         "Length of the measurement window for performance tests in seconds (default: 15)");
+    options.addOption(
+        null,
+        "barebones-run",
+        false,
+        "Run benchmark without scheduler metrics, perf monitoring, or window measurements");
+    options.addOption(
+        null,
+        "continuous",
+        false,
+        "Enable continuous reporting mode to periodically report benchmark statistics");
+    options.addOption(
+        null,
+        "continuous-window",
+        true,
+        "Window size in seconds for continuous reporting mode (default: 15)");
+    options.addOption(
+        null,
+        "continuous-perf",
+        false,
+        "Enable performance measurements during continuous reporting mode");
+    options.addOption(
+        null,
+        "continuous-buffer",
+        true,
+        "Buffer time in seconds between continuous reporting windows (default: 0)");
     return options;
   }
 
@@ -838,7 +936,11 @@ public class DBWorkload {
     }
 
     // Generate histograms for each parameter measurement window
-    rw.writeParameterWindowHistograms(activeTXTypes, outputDirectory, baseFileName);
+    if (!argsLine.hasOption("barebones-run")) {
+      rw.writeParameterWindowHistograms(activeTXTypes, outputDirectory, baseFileName);
+    } else {
+      LOG.info("Barebones run: skipping parameter window histograms");
+    }
   }
 
   private static void runCreator(BenchmarkModule bench) throws SQLException, IOException {
@@ -853,7 +955,13 @@ public class DBWorkload {
   }
 
   private static Results runWorkload(
-      List<BenchmarkModule> benchList, MonitorInfo monitorInfo, CommandLine argsLine)
+      List<BenchmarkModule> benchList,
+      MonitorInfo monitorInfo,
+      CommandLine argsLine,
+      boolean continuousReporting,
+      int continuousWindow,
+      boolean continuousPerf,
+      int continuousBuffer)
       throws IOException {
     List<Worker<?>> workers = new ArrayList<>();
     List<WorkloadConfiguration> workConfs = new ArrayList<>();
@@ -873,27 +981,32 @@ public class DBWorkload {
 
     // Configure scheduler parameters if provided
     if (argsLine.hasOption("sp")) {
-      String schedulerParamsStr = argsLine.getOptionValue("sp");
-      Map<String, List<Object>> schedulerParams = parseSchedulerParams(schedulerParamsStr);
+      // Skip scheduler parameter testing if in barebones mode
+      if (argsLine.hasOption("barebones-run")) {
+        LOG.info("Barebones run: skipping scheduler parameter testing");
+      } else {
+        String schedulerParamsStr = argsLine.getOptionValue("sp");
+        Map<String, List<Object>> schedulerParams = parseSchedulerParams(schedulerParamsStr);
 
-      // Calculate total number of workers across all benchmarks
-      int totalWorkers = 0;
-      for (WorkloadConfiguration workConf : workConfs) {
-        totalWorkers += workConf.getTerminals();
-      }
+        // Calculate total number of workers across all benchmarks
+        int totalWorkers = 0;
+        for (WorkloadConfiguration workConf : workConfs) {
+          totalWorkers += workConf.getTerminals();
+        }
 
-      // Configure the scheduler parameters with the total worker count
-      Results.configureSchedulerParams(schedulerParams, totalWorkers);
+        // Configure the scheduler parameters with the total worker count
+        Results.configureSchedulerParams(schedulerParams, totalWorkers);
 
-      // Check if benchmark runtime is sufficient for all parameter combinations
-      // Calculate the total runtime across all phases
+        // Check if benchmark runtime is sufficient for all parameter combinations
+        // Calculate the total runtime across all phases
 
-      for (WorkloadConfiguration workConf : workConfs) {
-        for (Phase phase : workConf.getPhases()) {
-          // Add both warmup and measured time
-          totalBenchmarkSeconds += phase.getTime();
-          totalBenchmarkSeconds += phase.getWarmupTime();
-          totalBenchmarkSeconds += 2;
+        for (WorkloadConfiguration workConf : workConfs) {
+          for (Phase phase : workConf.getPhases()) {
+            // Add both warmup and measured time
+            totalBenchmarkSeconds += phase.getTime();
+            totalBenchmarkSeconds += phase.getWarmupTime();
+            totalBenchmarkSeconds += 2;
+          }
         }
       }
     }
@@ -912,7 +1025,16 @@ public class DBWorkload {
       LOG.warn(timeConfigWarning);
     }
 
-    Results r = ThreadBench.runRateLimitedBenchmark(workers, workConfs, monitorInfo, argsLine);
+    Results r =
+        ThreadBench.runRateLimitedBenchmark(
+            workers,
+            workConfs,
+            monitorInfo,
+            argsLine,
+            continuousReporting,
+            continuousWindow,
+            continuousPerf,
+            continuousBuffer);
     LOG.info(SINGLE_LINE);
     LOG.info("Rate limited reqs/s: {}", r);
     return r;

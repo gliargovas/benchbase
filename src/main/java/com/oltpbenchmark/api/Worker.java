@@ -19,7 +19,11 @@ package com.oltpbenchmark.api;
 
 import static com.oltpbenchmark.types.State.MEASURE;
 
-import com.oltpbenchmark.*;
+import com.oltpbenchmark.LatencyRecord;
+import com.oltpbenchmark.Phase;
+import com.oltpbenchmark.SubmittedProcedure;
+import com.oltpbenchmark.WorkloadConfiguration;
+import com.oltpbenchmark.WorkloadState;
 import com.oltpbenchmark.api.Procedure.UserAbortException;
 import com.oltpbenchmark.types.DatabaseType;
 import com.oltpbenchmark.types.State;

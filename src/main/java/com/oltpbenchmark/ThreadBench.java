@@ -15,23 +15,6 @@
 
 package com.oltpbenchmark;
 
-import java.io.File;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.NoSuchElementException;
-import java.util.Set;
-
-import org.apache.commons.cli.CommandLine;
-import org.apache.commons.collections4.map.ListOrderedMap;
-import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.oltpbenchmark.LatencyRecord.Sample;
 import com.oltpbenchmark.api.BenchmarkModule;
 import com.oltpbenchmark.api.TransactionType;
@@ -44,6 +27,21 @@ import com.oltpbenchmark.util.JSONUtil;
 import com.oltpbenchmark.util.MonitorInfo;
 import com.oltpbenchmark.util.StringUtil;
 import com.oltpbenchmark.util.TimeUtil;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.collections4.map.ListOrderedMap;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class ThreadBench implements Thread.UncaughtExceptionHandler {
   private static final Logger LOG = LoggerFactory.getLogger(ThreadBench.class);
@@ -297,7 +295,7 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                       continue;
                     }
 
-                    // Collect current statistics from all workers
+                    // Start a new measurement window
                     windowNum++;
 
                     // Record the start time of this measurement window
@@ -305,9 +303,36 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                     String windowStartTime = TimeUtil.getCurrentTimeString();
 
                     LOG.info(
-                        "Collecting continuous report for window #{} at {}",
+                        "Starting continuous report for window #{} at {}",
                         windowNum,
                         windowStartTime);
+
+                    // We need to capture the current transaction counts at window start
+                    // so we can calculate only the new transactions in this window
+                    Map<Worker<?>, Integer> workerStartSuccesses = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartAborts = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartRetries = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartErrors = new HashMap<>();
+                    Map<Worker<?>, Integer> workerStartRequests = new HashMap<>();
+
+                    // Store the starting values for each worker
+                    for (Worker<?> worker : workers) {
+                      workerStartSuccesses.put(
+                          worker, worker.getTransactionSuccessHistogram().getSampleCount());
+                      workerStartAborts.put(
+                          worker, worker.getTransactionAbortHistogram().getSampleCount());
+                      workerStartRetries.put(
+                          worker, worker.getTransactionRetryHistogram().getSampleCount());
+                      workerStartErrors.put(
+                          worker, worker.getTransactionErrorHistogram().getSampleCount());
+                      workerStartRequests.put(worker, worker.getRequests());
+                    }
+
+                    // Sleep for the window duration
+                    Thread.sleep(continuousWindow * 1000);
+
+                    // Collect current statistics from all workers
+                    LOG.info("Collecting continuous report for window #{}", windowNum);
 
                     int totalRequests = 0;
                     int totalSuccesses = 0;
@@ -316,25 +341,44 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                     int totalErrors = 0;
                     List<Integer> latencies = new ArrayList<>();
 
-                    // Collect transaction statistics
-                    for (Worker<?> worker : workers) {
-                      totalSuccesses += worker.getTransactionSuccessHistogram().getSampleCount();
-                      totalAborts += worker.getTransactionAbortHistogram().getSampleCount();
-                      totalRetries += worker.getTransactionRetryHistogram().getSampleCount();
-                      totalErrors += worker.getTransactionErrorHistogram().getSampleCount();
-                      totalRequests += worker.getRequests();
-
-                      // Get latency samples directly from worker's latencies
-                      for (LatencyRecord.Sample sample : worker.getLatencyRecords()) {
-                        // Already in microseconds
-                        latencies.add(sample.getLatencyMicrosecond());
-                      }
-                    }
-
                     // Record end time of this measurement
                     long windowEndMs = System.currentTimeMillis();
                     String windowEndTime = TimeUtil.getCurrentTimeString();
                     long actualWindowDurationMs = windowEndMs - windowStartMs;
+
+                    // Collect only transactions that happened during this window
+                    for (int i = 0; i < workers.size(); i++) {
+                      Worker<? extends BenchmarkModule> worker = workers.get(i);
+
+                      // Calculate transaction statistics for this window
+                      int startSuccesses = workerStartSuccesses.get(worker);
+                      int endSuccesses = worker.getTransactionSuccessHistogram().getSampleCount();
+                      int windowSuccesses = endSuccesses - startSuccesses;
+                      totalSuccesses += windowSuccesses;
+
+                      int startAborts = workerStartAborts.get(worker);
+                      int endAborts = worker.getTransactionAbortHistogram().getSampleCount();
+                      int windowAborts = endAborts - startAborts;
+                      totalAborts += windowAborts;
+
+                      int startRetries = workerStartRetries.get(worker);
+                      int endRetries = worker.getTransactionRetryHistogram().getSampleCount();
+                      int windowRetries = endRetries - startRetries;
+                      totalRetries += windowRetries;
+
+                      int startErrors = workerStartErrors.get(worker);
+                      int endErrors = worker.getTransactionErrorHistogram().getSampleCount();
+                      int windowErrors = endErrors - startErrors;
+                      totalErrors += windowErrors;
+
+                      int startRequests = workerStartRequests.get(worker);
+                      int endRequests = worker.getRequests();
+                      int windowRequests = endRequests - startRequests;
+                      totalRequests += windowRequests;
+
+                      // Add the latency samples from this worker
+                      latencies.addAll(collectLatencySamples(worker, windowSuccesses));
+                    }
 
                     // Calculate throughput and goodput
                     double throughput = totalRequests / (double) continuousWindow;
@@ -428,6 +472,8 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                         String perfFileName = fileBase + ".window" + windowNum + ".perf";
                         String perfFilePath = FileUtil.joinPath(outputDirectory, perfFileName);
 
+                        // Record precise timestamp right before starting perf
+                        long perfStartMs = System.currentTimeMillis();
                         LOG.info("  Collecting performance metrics for window #{}", windowNum);
 
                         // Use ProcessBuilder instead of deprecated Runtime.exec
@@ -440,12 +486,17 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                                 "-o",
                                 perfFilePath,
                                 "sleep",
-                                "1");
+                                String.valueOf(continuousWindow));
                         Process process = processBuilder.start();
                         process.waitFor();
 
+                        // Record precise timestamp right after perf completes
+                        long perfEndMs = System.currentTimeMillis();
+
                         // Add perf file location to the report
                         report.put("perf_file", perfFileName);
+                        report.put("perf_start_ms", perfStartMs);
+                        report.put("perf_end_ms", perfEndMs);
                         LOG.info("  Performance metrics saved to: {}", perfFilePath);
 
                         // Write timestamp information to the perf file for later correlation
@@ -455,17 +506,19 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                                   + windowNum
                                   + "\n"
                                   + "# Start time: "
-                                  + windowStartTime
-                                  + " ("
-                                  + windowStartMs
-                                  + " ms)\n"
+                                  + perfStartMs
+                                  + " ms\n"
                                   + "# End time: "
-                                  + windowEndTime
-                                  + " ("
+                                  + perfEndMs
+                                  + " ms\n"
+                                  + "# Window start time: "
+                                  + windowStartMs
+                                  + " ms\n"
+                                  + "# Window end time: "
                                   + windowEndMs
-                                  + " ms)\n"
+                                  + " ms\n"
                                   + "# Duration: "
-                                  + actualWindowDurationMs
+                                  + (perfEndMs - perfStartMs)
                                   + " ms\n";
 
                           FileUtil.appendStringToFile(new File(perfFilePath), timestampInfo);
@@ -485,32 +538,37 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                       LOG.error("Error writing window report", e);
                     }
 
-                    // Now log everything to console
-                    LOG.info("Window #{} Summary:", windowNum);
-                    LOG.info("  Duration: {}s", continuousWindow);
-                    LOG.info("  Throughput: {} txn/s", String.format("%.2f", throughput));
-                    LOG.info("  Goodput: {} txn/s", String.format("%.2f", goodput));
+                    // Log detailed information about the window results
+                    LOG.info("Window #{} summary:", windowNum);
                     LOG.info(
-                        "  Success rate: {}%",
-                        String.format(
-                            "%.2f",
-                            totalRequests > 0 ? (totalSuccesses * 100.0 / totalRequests) : 0.0));
-                    LOG.info("  Transactions:");
-                    LOG.info("    Successful: {}", totalSuccesses);
-                    LOG.info("    Aborted:    {}", totalAborts);
-                    LOG.info("    Retried:    {}", totalRetries);
-                    LOG.info("    Errors:     {}", totalErrors);
-                    LOG.info("    Total:      {}", totalRequests);
-                    LOG.info("  Latency:");
-                    LOG.info("    Average: {} us", String.format("%.2f", avgLatency));
-                    LOG.info("    Minimum: {} us", minLatency);
-                    LOG.info("    Maximum: {} us", maxLatency);
-                    LOG.info("    p25: {} us", p25Latency);
-                    LOG.info("    p50: {} us", p50Latency);
-                    LOG.info("    p75: {} us", p75Latency);
-                    LOG.info("    p90: {} us", p90Latency);
-                    LOG.info("    p99: {} us", p99Latency);
-                    LOG.info("  Window report written to: {}", reportPath);
+                        "  Duration: {}s (actual: {} ms)",
+                        continuousWindow,
+                        actualWindowDurationMs);
+                    LOG.info(
+                        "  Throughput: {}/s, Goodput: {}/s, Success Rate: {:.2f}%",
+                        String.format("%.2f", throughput),
+                        String.format("%.2f", goodput),
+                        totalRequests > 0 ? (totalSuccesses * 100.0 / totalRequests) : 0.0);
+                    LOG.info(
+                        "  Transactions: {} successful, {} aborted, {} retried, {} errors, {} total",
+                        totalSuccesses,
+                        totalAborts,
+                        totalRetries,
+                        totalErrors,
+                        totalRequests);
+                    LOG.info("  Latency ({} samples):", latencies.size());
+                    LOG.info(
+                        "    Avg: {:.2f} μs, Min: {} μs, Max: {} μs",
+                        avgLatency,
+                        minLatency,
+                        maxLatency);
+                    LOG.info(
+                        "    p25: {} μs, p50: {} μs, p75: {} μs, p90: {} μs, p99: {} μs",
+                        p25Latency,
+                        p50Latency,
+                        p75Latency,
+                        p90Latency,
+                        p99Latency);
 
                     // If a buffer time is specified, sleep for that period
                     if (continuousBuffer > 0) {
@@ -938,5 +996,41 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
       index = 0;
     }
     return sorted.get(index);
+  }
+
+  /**
+   * Collects latency samples from a worker for a specific window. This ensures we only capture the
+   * latency samples that correspond to transactions completed during the measurement window, rather
+   * than using unreliable timestamps.
+   *
+   * @param worker The worker to collect latency samples from
+   * @param count The number of successful transactions completed in this window
+   * @return A list of valid latency values in microseconds
+   */
+  private List<Integer> collectLatencySamples(Worker<? extends BenchmarkModule> worker, int count) {
+    List<Integer> latencies = new ArrayList<>();
+
+    // Collect all valid latency samples from this worker
+    for (LatencyRecord.Sample sample : worker.getLatencyRecords()) {
+      if (sample.getLatencyMicrosecond() > 0) {
+        latencies.add(sample.getLatencyMicrosecond());
+      }
+    }
+
+    // Log how many samples we collected for debugging
+    LOG.debug(
+        "Worker {} collected {} latency samples (needed: {})",
+        worker.getId(),
+        latencies.size(),
+        count);
+
+    // If we have more samples than transactions, just take the most recent ones
+    // based on the count of successful transactions in this window
+    if (latencies.size() > count && count > 0) {
+      return latencies.subList(latencies.size() - count, latencies.size());
+    }
+
+    // Otherwise return all available samples
+    return latencies;
   }
 }

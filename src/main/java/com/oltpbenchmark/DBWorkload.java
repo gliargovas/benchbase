@@ -17,6 +17,19 @@
 
 package com.oltpbenchmark;
 
+import com.oltpbenchmark.api.BenchmarkModule;
+import com.oltpbenchmark.api.TransactionType;
+import com.oltpbenchmark.api.TransactionTypes;
+import com.oltpbenchmark.api.Worker;
+import com.oltpbenchmark.types.DatabaseType;
+import com.oltpbenchmark.types.State;
+import com.oltpbenchmark.util.ClassUtil;
+import com.oltpbenchmark.util.FileUtil;
+import com.oltpbenchmark.util.JSONSerializable;
+import com.oltpbenchmark.util.JSONUtil;
+import com.oltpbenchmark.util.MonitorInfo;
+import com.oltpbenchmark.util.ResultWriter;
+import com.oltpbenchmark.util.StringUtil;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -27,7 +40,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
-
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
@@ -45,20 +57,6 @@ import org.apache.commons.configuration2.tree.ImmutableNode;
 import org.apache.commons.configuration2.tree.xpath.XPathExpressionEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.oltpbenchmark.api.BenchmarkModule;
-import com.oltpbenchmark.api.TransactionType;
-import com.oltpbenchmark.api.TransactionTypes;
-import com.oltpbenchmark.api.Worker;
-import com.oltpbenchmark.types.DatabaseType;
-import com.oltpbenchmark.types.State;
-import com.oltpbenchmark.util.ClassUtil;
-import com.oltpbenchmark.util.FileUtil;
-import com.oltpbenchmark.util.JSONSerializable;
-import com.oltpbenchmark.util.JSONUtil;
-import com.oltpbenchmark.util.MonitorInfo;
-import com.oltpbenchmark.util.ResultWriter;
-import com.oltpbenchmark.util.StringUtil;
 
 public class DBWorkload {
   private static final Logger LOG = LoggerFactory.getLogger(DBWorkload.class);
@@ -176,6 +174,9 @@ public class DBWorkload {
         LOG.info("Buffer time between windows: {} seconds", continuousBuffer);
       }
       LOG.info("Live window metrics will be reported periodically during the benchmark run");
+      LOG.info("Each window captures only transactions executed during that specific time period");
+      LOG.info(
+          "Latency samples are collected based on the number of successful transactions in each window");
       LOG.info("Window reports will be saved to the results directory");
       if (continuousPerf) {
         LOG.info("Performance measurements will be collected during continuous reporting");
@@ -184,6 +185,8 @@ public class DBWorkload {
           "TIP: Consider using --barebones-run with --continuous for best monitoring experience");
       LOG.info(
           "Note: This mode runs alongside normal benchmark execution and reports live metrics");
+      LOG.info(
+          "      with latency distribution (Avg, P25, P50, P75, P90, P99, Min, Max) and goodput");
       LOG.info(SINGLE_LINE);
     }
 
@@ -671,8 +674,19 @@ public class DBWorkload {
           Results.setBarebonesMode(true);
         }
 
-        // Set continuous reporting mode if enabled
+        // Print out continuous reporting mode information if enabled
         if (continuousReporting) {
+          LOG.info("Enabling continuous reporting mode:");
+          LOG.info("  - Window Size: {}s", continuousWindow);
+          LOG.info(
+              "  - Measurement windows will capture only transactions executed during that specific time period");
+          LOG.info(
+              "  - Latency samples are collected based on the number of successful transactions in each window");
+          LOG.info(
+              "  - Live window metrics will be reported periodically during the benchmark run");
+          LOG.info(
+              "  - Performance metrics will be collected via 'perf' for the entire window duration when --continuous-perf is enabled");
+
           Results.setContinuousReportingMode(true, continuousWindow, continuousBuffer);
         }
 

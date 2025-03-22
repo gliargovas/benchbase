@@ -75,7 +75,12 @@ public class DBWorkload {
     // create the command line parser
     CommandLineParser parser = new DefaultParser();
 
-    XMLConfiguration pluginConfig = buildConfiguration("config/plugin.xml");
+    XMLConfiguration pluginConfig;
+    try {
+      pluginConfig = buildConfiguration("config/plugin.xml");
+    } catch (Exception e) {
+      pluginConfig = buildConfiguration("deps/benchbase/config/plugin.xml");
+    }
 
     Options options = buildOptions(pluginConfig);
 

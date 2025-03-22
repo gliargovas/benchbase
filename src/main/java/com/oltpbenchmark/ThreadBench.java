@@ -282,9 +282,6 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                 int windowNum = 0;
                 while (true) {
                   try {
-                    // Sleep for the specified window
-                    Thread.sleep(continuousWindow * 1000);
-
                     // Check if test is complete
                     if (testState.getState() == State.EXIT || testState.getState() == State.DONE) {
                       break;
@@ -292,6 +289,8 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
 
                     // Skip if we're not in the measurement phase yet
                     if (testState.getState() != State.MEASURE) {
+                      // Wait a bit before checking again
+                      Thread.sleep(1000);
                       continue;
                     }
 
@@ -306,6 +305,56 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                         "Starting continuous report for window #{} at {}",
                         windowNum,
                         windowStartTime);
+
+                    // Start perf monitoring asynchronously for this window if enabled
+                    Process perfProcess = null;
+                    String perfFilePath = null;
+                    String perfFileName = null;
+                    long perfStartMs = 0;
+
+                    if (continuousPerf) {
+                      try {
+                        // Prepare perf measurement for this window
+                        String fileBase = baseFileName.replace(".summary", "");
+                        perfFileName = fileBase + ".window" + windowNum + ".perf";
+
+                        // Determine output directory
+                        String outputDirectory = "results";
+                        if (argsLine.hasOption("d")) {
+                          outputDirectory = argsLine.getOptionValue("d");
+                        }
+
+                        // Create the directory if it doesn't exist
+                        FileUtil.makeDirIfNotExists(outputDirectory);
+
+                        perfFilePath = FileUtil.joinPath(outputDirectory, perfFileName);
+
+                        // Record precise timestamp right before starting perf
+                        perfStartMs = System.currentTimeMillis();
+                        LOG.info("  Starting performance monitoring for window #{}", windowNum);
+
+                        // Use ProcessBuilder to start perf asynchronously (non-blocking)
+                        ProcessBuilder processBuilder =
+                            new ProcessBuilder(
+                                "perf",
+                                "stat",
+                                "-e",
+                                "cycles,instructions,cache-references,cache-misses",
+                                "-o",
+                                perfFilePath,
+                                "sleep",
+                                String.valueOf(continuousWindow));
+
+                        // Start perf process asynchronously (non-blocking)
+                        perfProcess = processBuilder.start();
+
+                        LOG.debug(
+                            "  Performance monitoring started asynchronously for window #{}",
+                            windowNum);
+                      } catch (Exception e) {
+                        LOG.error("Error starting performance monitoring", e);
+                      }
+                    }
 
                     // We need to capture the current transaction counts at window start
                     // so we can calculate only the new transactions in this window
@@ -334,6 +383,42 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                     // Collect current statistics from all workers
                     LOG.info("Collecting continuous report for window #{}", windowNum);
 
+                    // Wait for perf process to complete if it's running
+                    long perfEndMs = 0;
+                    if (perfProcess != null) {
+                      try {
+                        perfProcess.waitFor();
+                        perfEndMs = System.currentTimeMillis();
+                        LOG.info("  Performance monitoring completed for window #{}", windowNum);
+
+                        // Write timestamp information to the perf file for later correlation
+                        try {
+                          String timestampInfo =
+                              "# Measurement window: "
+                                  + windowNum
+                                  + "\n"
+                                  + "# Start time: "
+                                  + perfStartMs
+                                  + " ms\n"
+                                  + "# End time: "
+                                  + perfEndMs
+                                  + " ms\n"
+                                  + "# Window start time: "
+                                  + windowStartMs
+                                  + " ms\n"
+                                  + "# Duration: "
+                                  + (perfEndMs - perfStartMs)
+                                  + " ms\n";
+
+                          FileUtil.appendStringToFile(new File(perfFilePath), timestampInfo);
+                        } catch (Exception e) {
+                          LOG.error("Error appending timestamp info to perf file", e);
+                        }
+                      } catch (Exception e) {
+                        LOG.error("Error waiting for performance monitoring to complete", e);
+                      }
+                    }
+
                     int totalRequests = 0;
                     int totalSuccesses = 0;
                     int totalAborts = 0;
@@ -345,6 +430,17 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                     long windowEndMs = System.currentTimeMillis();
                     String windowEndTime = TimeUtil.getCurrentTimeString();
                     long actualWindowDurationMs = windowEndMs - windowStartMs;
+
+                    // Append window end time to the perf file if it was created
+                    if (perfFilePath != null) {
+                      try {
+                        String additionalInfo = "# Window end time: " + windowEndMs + " ms\n";
+
+                        FileUtil.appendStringToFile(new File(perfFilePath), additionalInfo);
+                      } catch (Exception e) {
+                        LOG.error("Error appending window end time to perf file", e);
+                      }
+                    }
 
                     // Collect only transactions that happened during this window
                     for (int i = 0; i < workers.size(); i++) {
@@ -468,63 +564,11 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                     // Add perf measurements if enabled
                     if (continuousPerf) {
                       try {
-                        // Create a perf measurement for this window
-                        String perfFileName = fileBase + ".window" + windowNum + ".perf";
-                        String perfFilePath = FileUtil.joinPath(outputDirectory, perfFileName);
-
-                        // Record precise timestamp right before starting perf
-                        long perfStartMs = System.currentTimeMillis();
-                        LOG.info("  Collecting performance metrics for window #{}", windowNum);
-
-                        // Use ProcessBuilder instead of deprecated Runtime.exec
-                        ProcessBuilder processBuilder =
-                            new ProcessBuilder(
-                                "perf",
-                                "stat",
-                                "-e",
-                                "cycles,instructions,cache-references,cache-misses",
-                                "-o",
-                                perfFilePath,
-                                "sleep",
-                                String.valueOf(continuousWindow));
-                        Process process = processBuilder.start();
-                        process.waitFor();
-
-                        // Record precise timestamp right after perf completes
-                        long perfEndMs = System.currentTimeMillis();
-
                         // Add perf file location to the report
                         report.put("perf_file", perfFileName);
                         report.put("perf_start_ms", perfStartMs);
                         report.put("perf_end_ms", perfEndMs);
                         LOG.info("  Performance metrics saved to: {}", perfFilePath);
-
-                        // Write timestamp information to the perf file for later correlation
-                        try {
-                          String timestampInfo =
-                              "# Measurement window: "
-                                  + windowNum
-                                  + "\n"
-                                  + "# Start time: "
-                                  + perfStartMs
-                                  + " ms\n"
-                                  + "# End time: "
-                                  + perfEndMs
-                                  + " ms\n"
-                                  + "# Window start time: "
-                                  + windowStartMs
-                                  + " ms\n"
-                                  + "# Window end time: "
-                                  + windowEndMs
-                                  + " ms\n"
-                                  + "# Duration: "
-                                  + (perfEndMs - perfStartMs)
-                                  + " ms\n";
-
-                          FileUtil.appendStringToFile(new File(perfFilePath), timestampInfo);
-                        } catch (Exception e) {
-                          LOG.error("Error appending timestamp info to perf file", e);
-                        }
                       } catch (Exception e) {
                         LOG.error("Error collecting performance metrics", e);
                       }
@@ -541,14 +585,16 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                     // Log detailed information about the window results
                     LOG.info("Window #{} summary:", windowNum);
                     LOG.info(
-                        "  Duration: {}s (actual: {} ms)",
+                        "  Duration: {} s (actual: {} ms)",
                         continuousWindow,
                         actualWindowDurationMs);
                     LOG.info(
-                        "  Throughput: {}/s, Goodput: {}/s, Success Rate: {:.2f}%",
-                        String.format("%.2f", throughput),
-                        String.format("%.2f", goodput),
-                        totalRequests > 0 ? (totalSuccesses * 100.0 / totalRequests) : 0.0);
+                        "  Throughput: {} txn/s, Goodput: {} txn/s, Success Rate: {}%",
+                        String.format("%.3f", throughput),
+                        String.format("%.3f", goodput),
+                        String.format(
+                            "%.3f",
+                            totalRequests > 0 ? (totalSuccesses * 100.0 / totalRequests) : 0.0));
                     LOG.info(
                         "  Transactions: {} successful, {} aborted, {} retried, {} errors, {} total",
                         totalSuccesses,
@@ -558,8 +604,8 @@ public class ThreadBench implements Thread.UncaughtExceptionHandler {
                         totalRequests);
                     LOG.info("  Latency ({} samples):", latencies.size());
                     LOG.info(
-                        "    Avg: {:.2f} μs, Min: {} μs, Max: {} μs",
-                        avgLatency,
+                        "    Avg: {} μs, Min: {} μs, Max: {} μs",
+                        String.format("%.3f", avgLatency),
                         minLatency,
                         maxLatency);
                     LOG.info(
